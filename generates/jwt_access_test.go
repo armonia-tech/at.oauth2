@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
-	"gopkg.in/oauth2.v3"
-	"gopkg.in/oauth2.v3/generates"
-	"gopkg.in/oauth2.v3/models"
+	oauth2 "github.com/armonia-tech/at.oauth2"
+	generates "github.com/armonia-tech/at.oauth2/generates"
+	models "github.com/armonia-tech/at.oauth2/models"
+	jwt "github.com/dgrijalva/jwt-go"
 
 	. "github.com/smartystreets/goconvey/convey"
 )

@@ -7,10 +7,10 @@ import (
 
 	errs "errors"
 
-	"github.com/dgrijalva/jwt-go"
-	"gopkg.in/oauth2.v3"
-	"gopkg.in/oauth2.v3/errors"
-	"gopkg.in/oauth2.v3/utils/uuid"
+	oauth2 "github.com/armonia-tech/at.oauth2"
+	errors "github.com/armonia-tech/at.oauth2/errors"
+	uuid "github.com/armonia-tech/at.oauth2/utils/uuid"
+	jwt "github.com/dgrijalva/jwt-go"
 )
 
 // JWTAccessClaims jwt claims
