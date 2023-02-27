@@ -3,7 +3,7 @@ package manage_test
 import (
 	"testing"
 
-	manage "github.com/armonia-tech/at.oauth2/manage"
+	manage "github.com/armonia-tech/at.oauth2/v4/manage"
 
 	. "github.com/smartystreets/goconvey/convey"
 )

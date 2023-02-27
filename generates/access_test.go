@@ -1,12 +1,13 @@
 package generates_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	oauth2 "github.com/armonia-tech/at.oauth2"
-	generates "github.com/armonia-tech/at.oauth2/generates"
-	models "github.com/armonia-tech/at.oauth2/models"
+	oauth2 "github.com/armonia-tech/at.oauth2/v4"
+	generates "github.com/armonia-tech/at.oauth2/v4/generates"
+	models "github.com/armonia-tech/at.oauth2/v4/models"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
@@ -22,7 +23,7 @@ func TestAccess(t *testing.T) {
 			CreateAt: time.Now(),
 		}
 		gen := generates.NewAccessGenerate()
-		access, refresh, err := gen.Token(data, true)
+		access, refresh, err := gen.Token(context.Background(), data, true)
 		So(err, ShouldBeNil)
 		So(access, ShouldNotBeEmpty)
 		So(refresh, ShouldNotBeEmpty)
