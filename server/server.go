@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	oauth2 "github.com/armonia-tech/at.oauth2"
-	errors "github.com/armonia-tech/at.oauth2/errors"
+	oauth2 "github.com/armonia-tech/at.oauth2/v4"
+	errors "github.com/armonia-tech/at.oauth2/v4/errors"
 )
 
 // NewDefaultServer create a default authorization server
@@ -27,14 +28,12 @@ func NewServer(cfg *Config, manager oauth2.Manager) *Server {
 	// default handler
 	srv.ClientInfoHandler = ClientBasicHandler
 
-	srv.UserAuthorizationHandler = func(w http.ResponseWriter, r *http.Request) (userID string, err error) {
-		err = errors.ErrAccessDenied
-		return
+	srv.UserAuthorizationHandler = func(w http.ResponseWriter, r *http.Request) (string, error) {
+		return "", errors.ErrAccessDenied
 	}
 
-	srv.PasswordAuthorizationHandler = func(username, password string) (userID string, err error) {
-		err = errors.ErrAccessDenied
-		return
+	srv.PasswordAuthorizationHandler = func(ctx context.Context, clientID, username, password string) (string, error) {
+		return "", errors.ErrAccessDenied
 	}
 	return srv
 }
@@ -48,42 +47,54 @@ type Server struct {
 	ClientScopeHandler           ClientScopeHandler
 	UserAuthorizationHandler     UserAuthorizationHandler
 	PasswordAuthorizationHandler PasswordAuthorizationHandler
+	RefreshingValidationHandler  RefreshingValidationHandler
+	PreRedirectErrorHandler      PreRedirectErrorHandler
 	RefreshingScopeHandler       RefreshingScopeHandler
 	ResponseErrorHandler         ResponseErrorHandler
 	InternalErrorHandler         InternalErrorHandler
 	ExtensionFieldsHandler       ExtensionFieldsHandler
 	AccessTokenExpHandler        AccessTokenExpHandler
 	AuthorizeScopeHandler        AuthorizeScopeHandler
+	ResponseTokenHandler         ResponseTokenHandler
 }
 
-func (s *Server) redirectError(w http.ResponseWriter, req *AuthorizeRequest, err error) (uerr error) {
-	if req == nil {
-		uerr = err
-		return
+func (s *Server) handleError(w http.ResponseWriter, req *AuthorizeRequest, err error) error {
+	if fn := s.PreRedirectErrorHandler; fn != nil {
+		return fn(w, req, err)
 	}
-	data, _, _ := s.GetErrorData(err)
-	err = s.redirect(w, req, data)
-	return
+
+	return s.redirectError(w, req, err)
 }
 
-func (s *Server) redirect(w http.ResponseWriter, req *AuthorizeRequest, data map[string]interface{}) (err error) {
+func (s *Server) redirectError(w http.ResponseWriter, req *AuthorizeRequest, err error) error {
+	if req == nil {
+		return err
+	}
+
+	data, _, _ := s.GetErrorData(err)
+	return s.redirect(w, req, data)
+}
+
+func (s *Server) redirect(w http.ResponseWriter, req *AuthorizeRequest, data map[string]interface{}) error {
 	uri, err := s.GetRedirectURI(req, data)
 	if err != nil {
-		return
+		return err
 	}
+
 	w.Header().Set("Location", uri)
 	w.WriteHeader(302)
-	return
+	return nil
 }
 
-func (s *Server) TokenError(w http.ResponseWriter, err error) (uerr error) {
+func (s *Server) TokenError(w http.ResponseWriter, err error) error {
 	data, statusCode, header := s.GetErrorData(err)
-
-	uerr = s.Token(w, data, header, statusCode)
-	return
+	return s.Token(w, data, header, statusCode)
 }
 
-func (s *Server) Token(w http.ResponseWriter, data map[string]interface{}, header http.Header, statusCode ...int) (err error) {
+func (s *Server) Token(w http.ResponseWriter, data map[string]interface{}, header http.Header, statusCode ...int) error {
+	if fn := s.ResponseTokenHandler; fn != nil {
+		return fn(w, data, header, statusCode...)
+	}
 	w.Header().Set("Content-Type", "application/json;charset=UTF-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
@@ -98,15 +109,14 @@ func (s *Server) Token(w http.ResponseWriter, data map[string]interface{}, heade
 	}
 
 	w.WriteHeader(status)
-	err = json.NewEncoder(w).Encode(data)
-	return
+	return json.NewEncoder(w).Encode(data)
 }
 
 // GetRedirectURI get redirect uri
-func (s *Server) GetRedirectURI(req *AuthorizeRequest, data map[string]interface{}) (uri string, err error) {
+func (s *Server) GetRedirectURI(req *AuthorizeRequest, data map[string]interface{}) (string, error) {
 	u, err := url.Parse(req.RedirectURI)
 	if err != nil {
-		return
+		return "", err
 	}
 
 	q := u.Query()
@@ -123,14 +133,14 @@ func (s *Server) GetRedirectURI(req *AuthorizeRequest, data map[string]interface
 		u.RawQuery = q.Encode()
 	case oauth2.Token:
 		u.RawQuery = ""
-		u.Fragment, err = url.QueryUnescape(q.Encode())
+		fragment, err := url.QueryUnescape(q.Encode())
 		if err != nil {
-			return
+			return "", err
 		}
+		u.Fragment = fragment
 	}
 
-	uri = u.String()
-	return
+	return u.String(), nil
 }
 
 // CheckResponseType check allows response type
@@ -143,67 +153,76 @@ func (s *Server) CheckResponseType(rt oauth2.ResponseType) bool {
 	return false
 }
 
+// CheckCodeChallengeMethod checks for allowed code challenge method
+func (s *Server) CheckCodeChallengeMethod(ccm oauth2.CodeChallengeMethod) bool {
+	for _, c := range s.Config.AllowedCodeChallengeMethods {
+		if c == ccm {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidationAuthorizeRequest the authorization request validation
-func (s *Server) ValidationAuthorizeRequest(r *http.Request) (req *AuthorizeRequest, err error) {
+func (s *Server) ValidationAuthorizeRequest(r *http.Request) (*AuthorizeRequest, error) {
 	redirectURI := r.FormValue("redirect_uri")
 	clientID := r.FormValue("client_id")
 	if !(r.Method == "GET" || r.Method == "POST") ||
 		clientID == "" {
-		err = errors.ErrInvalidRequest
-		return
+		return nil, errors.ErrInvalidRequest
 	}
 
 	resType := oauth2.ResponseType(r.FormValue("response_type"))
-
 	if resType.String() == "" {
-		err = errors.ErrUnsupportedResponseType
-		return
+		return nil, errors.ErrUnsupportedResponseType
 	} else if allowed := s.CheckResponseType(resType); !allowed {
-		err = errors.ErrUnauthorizedClient
-		return
+		return nil, errors.ErrUnauthorizedClient
 	}
 
-	req = &AuthorizeRequest{
-		RedirectURI:  redirectURI,
-		ResponseType: resType,
-		ClientID:     clientID,
-		State:        r.FormValue("state"),
-		Scope:        r.FormValue("scope"),
-		Request:      r,
+	cc := r.FormValue("code_challenge")
+	if cc == "" && s.Config.ForcePKCE {
+		return nil, errors.ErrCodeChallengeRquired
 	}
-	return
+	if cc != "" && (len(cc) < 43 || len(cc) > 128) {
+		return nil, errors.ErrInvalidCodeChallengeLen
+	}
+
+	ccm := oauth2.CodeChallengeMethod(r.FormValue("code_challenge_method"))
+	// set default
+	if ccm == "" {
+		ccm = oauth2.CodeChallengePlain
+	}
+	if ccm != "" && !s.CheckCodeChallengeMethod(ccm) {
+		return nil, errors.ErrUnsupportedCodeChallengeMethod
+	}
+
+	req := &AuthorizeRequest{
+		RedirectURI:         redirectURI,
+		ResponseType:        resType,
+		ClientID:            clientID,
+		State:               r.FormValue("state"),
+		Scope:               r.FormValue("scope"),
+		Request:             r,
+		CodeChallenge:       cc,
+		CodeChallengeMethod: ccm,
+	}
+	return req, nil
 }
 
 // GetAuthorizeToken get authorization token(code)
-func (s *Server) GetAuthorizeToken(req *AuthorizeRequest) (ti oauth2.TokenInfo, err error) {
+func (s *Server) GetAuthorizeToken(ctx context.Context, req *AuthorizeRequest) (oauth2.TokenInfo, error) {
 	// check the client allows the grant type
 	if fn := s.ClientAuthorizedHandler; fn != nil {
 		gt := oauth2.AuthorizationCode
-
 		if req.ResponseType == oauth2.Token {
 			gt = oauth2.Implicit
 		}
 
-		allowed, verr := fn(req.ClientID, gt)
-		if verr != nil {
-			err = verr
-			return
+		allowed, err := fn(req.ClientID, gt)
+		if err != nil {
+			return nil, err
 		} else if !allowed {
-			err = errors.ErrUnauthorizedClient
-			return
-		}
-	}
-
-	// check the client allows the authorized scope
-	if fn := s.ClientScopeHandler; fn != nil {
-
-		allowed, verr := fn(req.ClientID, req.Scope)
-		if verr != nil {
-			err = verr
-			return
-		} else if !allowed {
-			err = errors.ErrInvalidScope
-			return
+			return nil, errors.ErrUnauthorizedClient
 		}
 	}
 
@@ -216,49 +235,55 @@ func (s *Server) GetAuthorizeToken(req *AuthorizeRequest) (ti oauth2.TokenInfo, 
 		Request:        req.Request,
 	}
 
-	ti, err = s.Manager.GenerateAuthToken(req.ResponseType, tgr)
-	return
+	// check the client allows the authorized scope
+	if fn := s.ClientScopeHandler; fn != nil {
+		allowed, err := fn(tgr)
+		if err != nil {
+			return nil, err
+		} else if !allowed {
+			return nil, errors.ErrInvalidScope
+		}
+	}
+
+	tgr.CodeChallenge = req.CodeChallenge
+	tgr.CodeChallengeMethod = req.CodeChallengeMethod
+
+	return s.Manager.GenerateAuthToken(ctx, req.ResponseType, tgr)
 }
 
 // GetAuthorizeData get authorization response data
-func (s *Server) GetAuthorizeData(rt oauth2.ResponseType, ti oauth2.TokenInfo) (data map[string]interface{}) {
+func (s *Server) GetAuthorizeData(rt oauth2.ResponseType, ti oauth2.TokenInfo) map[string]interface{} {
 	if rt == oauth2.Code {
-		data = map[string]interface{}{
+		return map[string]interface{}{
 			"code": ti.GetCode(),
 		}
-	} else {
-		data = s.GetTokenData(ti)
 	}
-	return
+	return s.GetTokenData(ti)
 }
 
 // HandleAuthorizeRequest the authorization request handling
-func (s *Server) HandleAuthorizeRequest(w http.ResponseWriter, r *http.Request) (err error) {
-	req, verr := s.ValidationAuthorizeRequest(r)
-	if verr != nil {
-		err = s.redirectError(w, req, verr)
-		return
+func (s *Server) HandleAuthorizeRequest(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+
+	req, err := s.ValidationAuthorizeRequest(r)
+	if err != nil {
+		return s.handleError(w, req, err)
 	}
 
 	// user authorization
-	userID, verr := s.UserAuthorizationHandler(w, r)
-
-	if verr != nil {
-		err = s.redirectError(w, req, verr)
-		return
+	userID, err := s.UserAuthorizationHandler(w, r)
+	if err != nil {
+		return s.handleError(w, req, err)
 	} else if userID == "" {
-		return
+		return nil
 	}
-
 	req.UserID = userID
 
 	// specify the scope of authorization
 	if fn := s.AuthorizeScopeHandler; fn != nil {
-
-		scope, verr := fn(w, r)
-		if verr != nil {
-			err = verr
-			return
+		scope, err := fn(w, r)
+		if err != nil {
+			return err
 		} else if scope != "" {
 			req.Scope = scope
 		}
@@ -266,56 +291,48 @@ func (s *Server) HandleAuthorizeRequest(w http.ResponseWriter, r *http.Request) 
 
 	// specify the expiration time of access token
 	if fn := s.AccessTokenExpHandler; fn != nil {
-
-		exp, verr := fn(w, r)
-		if verr != nil {
-			err = verr
-			return
+		exp, err := fn(w, r)
+		if err != nil {
+			return err
 		}
 		req.AccessTokenExp = exp
 	}
 
-	ti, verr := s.GetAuthorizeToken(req)
-	if verr != nil {
-		err = s.redirectError(w, req, verr)
-		return
+	ti, err := s.GetAuthorizeToken(ctx, req)
+	if err != nil {
+		return s.handleError(w, req, err)
 	}
 
 	// If the redirect URI is empty, the default domain provided by the client is used.
 	if req.RedirectURI == "" {
-		client, verr := s.Manager.GetClient(req.ClientID)
-		if verr != nil {
-			err = verr
-			return
+		client, err := s.Manager.GetClient(ctx, req.ClientID)
+		if err != nil {
+			return err
 		}
 		req.RedirectURI = client.GetDomain()
 	}
 
-	err = s.redirect(w, req, s.GetAuthorizeData(req.ResponseType, ti))
-	return
+	return s.redirect(w, req, s.GetAuthorizeData(req.ResponseType, ti))
 }
 
 // ValidationTokenRequest the token request validation
-func (s *Server) ValidationTokenRequest(r *http.Request) (gt oauth2.GrantType, tgr *oauth2.TokenGenerateRequest, err error) {
+func (s *Server) ValidationTokenRequest(r *http.Request) (oauth2.GrantType, *oauth2.TokenGenerateRequest, error) {
 	if v := r.Method; !(v == "POST" ||
 		(s.Config.AllowGetAccessRequest && v == "GET")) {
-		err = errors.ErrInvalidRequest
-		return
+		return "", nil, errors.ErrInvalidRequest
 	}
 
-	gt = oauth2.GrantType(r.FormValue("grant_type"))
-
+	gt := oauth2.GrantType(r.FormValue("grant_type"))
 	if gt.String() == "" {
-		err = errors.ErrUnsupportedGrantType
-		return
+		return "", nil, errors.ErrUnsupportedGrantType
 	}
 
 	clientID, clientSecret, err := s.ClientInfoHandler(r)
 	if err != nil {
-		return
+		return "", nil, err
 	}
 
-	tgr = &oauth2.TokenGenerateRequest{
+	tgr := &oauth2.TokenGenerateRequest{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		Request:      r,
@@ -325,42 +342,38 @@ func (s *Server) ValidationTokenRequest(r *http.Request) (gt oauth2.GrantType, t
 	case oauth2.AuthorizationCode:
 		tgr.RedirectURI = r.FormValue("redirect_uri")
 		tgr.Code = r.FormValue("code")
-
 		if tgr.RedirectURI == "" ||
 			tgr.Code == "" {
-			err = errors.ErrInvalidRequest
-			return
+			return "", nil, errors.ErrInvalidRequest
+		}
+		tgr.CodeVerifier = r.FormValue("code_verifier")
+		if s.Config.ForcePKCE && tgr.CodeVerifier == "" {
+			return "", nil, errors.ErrInvalidRequest
 		}
 	case oauth2.PasswordCredentials:
 		tgr.Scope = r.FormValue("scope")
 		username, password := r.FormValue("username"), r.FormValue("password")
-
 		if username == "" || password == "" {
-			err = errors.ErrInvalidRequest
-			return
+			return "", nil, errors.ErrInvalidRequest
 		}
 
-		userID, verr := s.PasswordAuthorizationHandler(username, password)
-		if verr != nil {
-			err = verr
-			return
+		userID, err := s.PasswordAuthorizationHandler(r.Context(), clientID, username, password)
+		if err != nil {
+			return "", nil, err
 		} else if userID == "" {
-			err = errors.ErrInvalidGrant
-			return
+			return "", nil, errors.ErrInvalidGrant
 		}
-
 		tgr.UserID = userID
 	case oauth2.ClientCredentials:
 		tgr.Scope = r.FormValue("scope")
 	case oauth2.Refreshing:
 		tgr.Refresh = r.FormValue("refresh_token")
 		tgr.Scope = r.FormValue("scope")
-
 		if tgr.Refresh == "" {
-			err = errors.ErrInvalidRequest
+			return "", nil, errors.ErrInvalidRequest
 		}
 	}
-	return
+	return gt, tgr, nil
 }
 
 // CheckGrantType check allows grant type
@@ -374,93 +387,96 @@ func (s *Server) CheckGrantType(gt oauth2.GrantType) bool {
 }
 
 // GetAccessToken access token
-func (s *Server) GetAccessToken(gt oauth2.GrantType, tgr *oauth2.TokenGenerateRequest) (ti oauth2.TokenInfo, err error) {
+func (s *Server) GetAccessToken(ctx context.Context, gt oauth2.GrantType, tgr *oauth2.TokenGenerateRequest) (oauth2.TokenInfo,
+	error) {
 	if allowed := s.CheckGrantType(gt); !allowed {
-		err = errors.ErrUnauthorizedClient
-		return
+		return nil, errors.ErrUnauthorizedClient
 	}
 
 	if fn := s.ClientAuthorizedHandler; fn != nil {
-		allowed, verr := fn(tgr.ClientID, gt)
-		if verr != nil {
-			err = verr
-			return
+		allowed, err := fn(tgr.ClientID, gt)
+		if err != nil {
+			return nil, err
 		} else if !allowed {
-			err = errors.ErrUnauthorizedClient
-			return
+			return nil, errors.ErrUnauthorizedClient
 		}
 	}
 
 	switch gt {
 	case oauth2.AuthorizationCode:
-		ati, verr := s.Manager.GenerateAccessToken(gt, tgr)
-		if verr != nil {
-
-			if verr == errors.ErrInvalidAuthorizeCode {
-				err = errors.ErrInvalidGrant
-			} else if verr == errors.ErrInvalidClient {
-				err = errors.ErrInvalidClient
-			} else {
-				err = verr
+		ti, err := s.Manager.GenerateAccessToken(ctx, gt, tgr)
+		if err != nil {
+			switch err {
+			case errors.ErrInvalidAuthorizeCode, errors.ErrInvalidCodeChallenge, errors.ErrMissingCodeChallenge:
+				return nil, errors.ErrInvalidGrant
+			case errors.ErrInvalidClient:
+				return nil, errors.ErrInvalidClient
+			default:
+				return nil, err
 			}
-			return
 		}
-		ti = ati
+		return ti, nil
 	case oauth2.PasswordCredentials, oauth2.ClientCredentials:
 		if fn := s.ClientScopeHandler; fn != nil {
-
-			allowed, verr := fn(tgr.ClientID, tgr.Scope)
-			if verr != nil {
-				err = verr
-				return
+			allowed, err := fn(tgr)
+			if err != nil {
+				return nil, err
 			} else if !allowed {
-				err = errors.ErrInvalidScope
-				return
+				return nil, errors.ErrInvalidScope
 			}
 		}
-		ti, err = s.Manager.GenerateAccessToken(gt, tgr)
+		return s.Manager.GenerateAccessToken(ctx, gt, tgr)
 	case oauth2.Refreshing:
 		// check scope
-		if scope, scopeFn := tgr.Scope, s.RefreshingScopeHandler; scope != "" && scopeFn != nil {
-
-			rti, verr := s.Manager.LoadRefreshToken(tgr.Refresh)
-			if verr != nil {
-				if verr == errors.ErrInvalidRefreshToken || verr == errors.ErrExpiredRefreshToken {
-					err = errors.ErrInvalidGrant
-					return
+		if scopeFn := s.RefreshingScopeHandler; tgr.Scope != "" && scopeFn != nil {
+			rti, err := s.Manager.LoadRefreshToken(ctx, tgr.Refresh)
+			if err != nil {
+				if err == errors.ErrInvalidRefreshToken || err == errors.ErrExpiredRefreshToken {
+					return nil, errors.ErrInvalidGrant
 				}
-				err = verr
-				return
+				return nil, err
 			}
 
-			allowed, verr := scopeFn(scope, rti.GetScope())
-			if verr != nil {
-				err = verr
-				return
+			allowed, err := scopeFn(tgr, rti.GetScope())
+			if err != nil {
+				return nil, err
 			} else if !allowed {
-				err = errors.ErrInvalidScope
-				return
+				return nil, errors.ErrInvalidScope
 			}
 		}
 
-		rti, verr := s.Manager.RefreshAccessToken(tgr)
-		if verr != nil {
-			if verr == errors.ErrInvalidRefreshToken || verr == errors.ErrExpiredRefreshToken {
-				err = errors.ErrInvalidGrant
-			} else {
-				err = verr
+		if validationFn := s.RefreshingValidationHandler; validationFn != nil {
+			rti, err := s.Manager.LoadRefreshToken(ctx, tgr.Refresh)
+			if err != nil {
+				if err == errors.ErrInvalidRefreshToken || err == errors.ErrExpiredRefreshToken {
+					return nil, errors.ErrInvalidGrant
+				}
+				return nil, err
 			}
-			return
+			allowed, err := validationFn(rti)
+			if err != nil {
+				return nil, err
+			} else if !allowed {
+				return nil, errors.ErrInvalidScope
+			}
 		}
-		ti = rti
+
+		ti, err := s.Manager.RefreshAccessToken(ctx, tgr)
+		if err != nil {
+			if err == errors.ErrInvalidRefreshToken || err == errors.ErrExpiredRefreshToken {
+				return nil, errors.ErrInvalidGrant
+			}
+			return nil, err
+		}
+		return ti, nil
 	}
 
-	return
+	return nil, errors.ErrUnsupportedGrantType
 }
 
 // GetTokenData token data
-func (s *Server) GetTokenData(ti oauth2.TokenInfo) (data map[string]interface{}) {
-	data = map[string]interface{}{
+func (s *Server) GetTokenData(ti oauth2.TokenInfo) map[string]interface{} {
+	data := map[string]interface{}{
 		"access_token": ti.GetAccess(),
 		"token_type":   s.Config.TokenType,
 		"expires_in":   int64(ti.GetAccessExpiresIn() / time.Second),
@@ -483,39 +499,37 @@ func (s *Server) GetTokenData(ti oauth2.TokenInfo) (data map[string]interface{})
 			data[k] = v
 		}
 	}
-	return
+	return data
 }
 
 // HandleTokenRequest token request handling
-func (s *Server) HandleTokenRequest(w http.ResponseWriter, r *http.Request) (err error) {
-	gt, tgr, verr := s.ValidationTokenRequest(r)
-	if verr != nil {
-		err = s.TokenError(w, verr)
-		return
+func (s *Server) HandleTokenRequest(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+
+	gt, tgr, err := s.ValidationTokenRequest(r)
+	if err != nil {
+		return s.TokenError(w, err)
 	}
 
-	ti, verr := s.GetAccessToken(gt, tgr)
-	if verr != nil {
-		err = s.TokenError(w, verr)
-		return
+	ti, err := s.GetAccessToken(ctx, gt, tgr)
+	if err != nil {
+		return s.TokenError(w, err)
 	}
 
-	err = s.Token(w, s.GetTokenData(ti), nil)
-	return
+	return s.Token(w, s.GetTokenData(ti), nil)
 }
 
 // GetErrorData get error response data
-func (s *Server) GetErrorData(err error) (data map[string]interface{}, statusCode int, header http.Header) {
-	re := new(errors.Response)
-
+func (s *Server) GetErrorData(err error) (map[string]interface{}, int, http.Header) {
+	var re errors.Response
 	if v, ok := errors.Descriptions[err]; ok {
 		re.Error = err
 		re.Description = v
 		re.StatusCode = errors.StatusCodes[err]
 	} else {
 		if fn := s.InternalErrorHandler; fn != nil {
-			if vre := fn(err); vre != nil {
-				re = vre
+			if v := fn(err); v != nil {
+				re = *v
 			}
 		}
 
@@ -527,15 +541,10 @@ func (s *Server) GetErrorData(err error) (data map[string]interface{}, statusCod
 	}
 
 	if fn := s.ResponseErrorHandler; fn != nil {
-		fn(re)
-
-		if re == nil {
-			re = new(errors.Response)
-		}
+		fn(&re)
 	}
 
-	data = make(map[string]interface{})
-
+	data := make(map[string]interface{})
 	if err := re.Error; err != nil {
 		data["error"] = err.Error()
 	}
@@ -552,44 +561,38 @@ func (s *Server) GetErrorData(err error) (data map[string]interface{}, statusCod
 		data["error_uri"] = v
 	}
 
-	header = re.Header
-
-	statusCode = http.StatusInternalServerError
+	statusCode := http.StatusInternalServerError
 	if v := re.StatusCode; v > 0 {
 		statusCode = v
 	}
 
-	return
+	return data, statusCode, re.Header
 }
 
 // BearerAuth parse bearer token
-func (s *Server) BearerAuth(r *http.Request) (accessToken string, ok bool) {
+func (s *Server) BearerAuth(r *http.Request) (string, bool) {
 	auth := r.Header.Get("Authorization")
 	prefix := "Bearer "
+	token := ""
 
 	if auth != "" && strings.HasPrefix(auth, prefix) {
-		accessToken = auth[len(prefix):]
+		token = auth[len(prefix):]
 	} else {
-		accessToken = r.FormValue("access_token")
+		token = r.FormValue("access_token")
 	}
 
-	if accessToken != "" {
-		ok = true
-	}
-
-	return
+	return token, token != ""
 }
 
 // ValidationBearerToken validation the bearer tokens
 // https://tools.ietf.org/html/rfc6750
-func (s *Server) ValidationBearerToken(r *http.Request) (ti oauth2.TokenInfo, err error) {
+func (s *Server) ValidationBearerToken(r *http.Request) (oauth2.TokenInfo, error) {
+	ctx := r.Context()
+
 	accessToken, ok := s.BearerAuth(r)
 	if !ok {
-		err = errors.ErrInvalidAccessToken
-		return
+		return nil, errors.ErrInvalidAccessToken
 	}
 
-	ti, err = s.Manager.LoadAccessToken(accessToken)
-
-	return
+	return s.Manager.LoadAccessToken(ctx, accessToken)
 }
